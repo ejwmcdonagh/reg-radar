@@ -10,13 +10,14 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
-import truststore
 from fastapi import Depends, FastAPI
 
-# Inject the OS native trust store (macOS Keychain) into Python's ssl module.
-# Required on corporate networks where a proxy CA is trusted by the system
-# but not present in certifi's bundled CA list.
-truststore.inject_into_ssl()
+from app.tls import configure_trust
+
+# Trust the OS certificate store, required on corporate networks where a proxy CA
+# is trusted by the system but absent from certifi's bundle. Shared with the evals
+# and the review script so all three behave identically.
+configure_trust()
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import require_api_key

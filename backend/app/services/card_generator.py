@@ -23,9 +23,28 @@ import anthropic
 
 from app.config import settings
 from app.db.client import get_db
+from app.services.card_validation import (
+    blocking_errors,
+    normalise_card,
+    normalise_title,
+    validate_card,
+)
 from app.services.embeddings import search_regulations
 
 logger = logging.getLogger(__name__)
+
+# How many times the agent may rewrite one card before the cluster is failed.
+# Board-facing copy fails closed: a card citing a fine figure that appears in no
+# retrieved regulation is worse than no card at all.
+_VALIDATION_ATTEMPTS = 3
+
+
+class CardValidationError(Exception):
+    """The agent could not produce a card meeting the contract within the retry budget."""
+
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("; ".join(errors))
+        self.errors = errors
 
 _CARD_TOOL: dict[str, Any] = {
     "name": "write_risk_card",
@@ -44,7 +63,14 @@ _CARD_TOOL: dict[str, Any] = {
                     "type": "object",
                     "properties": {
                         "source": {"type": "string"},
-                        "title": {"type": "string"},
+                        "title": {
+                            "type": "string",
+                            "description": (
+                                "Copy the value of the signal's 'title:' field exactly, and nothing else. "
+                                "Do not include the source, the severity, or the summary, and do not reword it. "
+                                "This is how the card is matched back to the stored link."
+                            ),
+                        },
                         "url": {"type": "string"},
                         "point": {"type": "string", "description": "One sentence on what this signal adds to the risk picture"},
                     },
@@ -67,7 +93,9 @@ _CARD_TOOL: dict[str, Any] = {
             "simple_headline": {
                 "type": "string",
                 "description": (
-                    "One sentence, max 15 words, for a non-technical board director or CFO. "
+                    "HARD LIMIT 15 words. Count the words before you return, and aim for 12 - "
+                    "the agent overshoots this cap more than any other field. "
+                    "One sentence for a non-technical board director or CFO. "
                     "Explain the real-world risk in plain English with zero technical terms. "
                     "No CVE numbers, no product names, no vulnerability class names (no 'authentication bypass', "
                     "'SQL injection', 'RCE', 'buffer overflow', 'XSS', 'privilege escalation', etc.). "
@@ -113,6 +141,24 @@ Board talking point: write for non-technical directors. Plain English, no CVE nu
 All other layers: write for the CISO - technically literate, commercially aware. Reference real frameworks where relevant: NIS2, UK GDPR, DORA, FCA SYSC 13, ISO 27001, NCSC CAF.
 
 Do not fabricate CVE numbers, vendor names, or breach figures beyond what the signals contain."""
+
+
+def resolve_evidence_urls(
+    evidence_stack: list[dict[str, Any]],
+    signals: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Point every evidence link at the stored signal URL, never the agent's.
+
+    The agent writes plausible landing pages from memory when it cannot recall the
+    real link, and those survive review because they look correct. The stored URL
+    is the one that was actually fetched, so it always wins.
+    """
+    url_by_title = {normalise_title(s["title"]): s.get("url", "") for s in signals}
+    return [
+        {**item, "url": url_by_title.get(normalise_title(item.get("title", "")), "")}
+        for item in evidence_stack
+    ]
 
 
 async def generate_cards(cluster_ids: list[str] | None = None) -> int:
@@ -177,14 +223,22 @@ async def generate_cards(cluster_ids: list[str] | None = None) -> int:
             card_written = await _generate_one(db, client, cluster)
             if card_written:
                 written += 1
-        except Exception:
+        except Exception as exc:
             logger.exception("Card generation failed for cluster %s", cluster["id"])
             attempts = (cluster.get("card_generation_attempts") or 0) + 1
             new_status = "failed" if attempts >= _MAX_ATTEMPTS else "pending"
-            db.table("signal_clusters").update({
+            update: dict[str, Any] = {
                 "card_generation_attempts": attempts,
                 "status": new_status,
-            }).eq("id", cluster["id"]).execute()
+            }
+            # Keep the reason on the row so a rejected cluster can be triaged
+            # without digging through logs from a run that happened overnight.
+            if isinstance(exc, CardValidationError):
+                update["metadata"] = {
+                    **(cluster.get("metadata") or {}),
+                    "validation_errors": exc.errors,
+                }
+            db.table("signal_clusters").update(update).eq("id", cluster["id"]).execute()
             if new_status == "failed":
                 logger.warning(
                     "Cluster %s marked failed after %d attempts - will not be retried",
@@ -233,8 +287,16 @@ async def _generate_one(db: Any, client: anthropic.Anthropic, cluster: dict[str,
         for s in signals
     ]
 
-    # Build regulation context block - empty string when RAG unavailable (key absent or call failed)
-    reg_context = ""
+    # With nothing retrieved the agent falls back on remembered regulation text and
+    # writes article numbers and fine figures it cannot support. Saying so explicitly
+    # is what stops it: validation would otherwise reject the card three times and
+    # fail the cluster outright.
+    reg_context = (
+        "\n\nNo regulatory context was retrieved for this cluster. Name frameworks in "
+        "general terms only (NIS2, UK GDPR, DORA, FCA SYSC 13, ISO 27001, NCSC CAF). "
+        "Do NOT cite article numbers, control references, or fine figures anywhere in "
+        "the card - there is no source text here to support them."
+    )
     if reg_chunks:
         chunk_lines = []
         for chunk in reg_chunks:
@@ -255,41 +317,91 @@ async def _generate_one(db: Any, client: anthropic.Anthropic, cluster: dict[str,
         f"Source count: {cluster['source_count']}\n"
         f"Highest severity: {cluster.get('severity_max') or 'unknown'}\n\n"
         f"Signals:\n"
-        + "\n".join(
-            f"- [{s['source']}] {s['title']}"
-            + (f" (severity: {s['severity']})" if s.get("severity") else "")
-            + (f"\n  {s['summary']}" if s.get("summary") else "")
+        # Each field on its own labelled line. When the title was rendered inline as
+        # "- [SOURCE] title (severity: X)" the agent copied the whole decorated line
+        # into evidence_stack.title, which then matched no stored signal.
+        + "\n\n".join(
+            f"- title: {s['title']}\n  source: {s['source']}"
+            + (f"\n  severity: {s['severity']}" if s.get("severity") else "")
+            + (f"\n  summary: {s['summary']}" if s.get("summary") else "")
             for s in signal_descriptions
         )
         + reg_context
     )
 
-    response = await client.messages.create(
-        # To switch to Opus, replace the model string and uncomment the thinking line.
-        # Thinking is not supported on Haiku - only uncomment it when using Opus.
-        model="claude-haiku-4-5-20251001",
-        # model="claude-opus-4-7",
-        max_tokens=1500,
-        system=_SYSTEM_PROMPT,
-        tools=[_CARD_TOOL],
-        tool_choice={"type": "tool", "name": "write_risk_card"},
-        messages=[{"role": "user", "content": user_message}],
-    )
+    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+    card_input: dict[str, Any] | None = None
+    errors: list[str] = []
+    attempt = 0
 
-    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
-    if not tool_block:
-        logger.warning("No tool_use block in card generation response for cluster %s", cluster_id)
-        return False
+    for attempt in range(1, _VALIDATION_ATTEMPTS + 1):
+        response = await client.messages.create(
+            # To switch to Opus, replace the model string and uncomment the thinking line.
+            # Thinking is not supported on Haiku - only uncomment it when using Opus.
+            model="claude-haiku-4-5-20251001",
+            # model="claude-opus-4-7",
+            max_tokens=1500,
+            system=_SYSTEM_PROMPT,
+            tools=[_CARD_TOOL],
+            tool_choice={"type": "tool", "name": "write_risk_card"},
+            messages=messages,
+        )
 
-    card_input: dict[str, Any] = tool_block.input
+        tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+        if not tool_block:
+            logger.warning("No tool_use block in card generation response for cluster %s", cluster_id)
+            return False
+
+        candidate = normalise_card(tool_block.input)
+        errors = validate_card(candidate, signal_descriptions, reg_chunks)
+        if not errors:
+            card_input = candidate
+            break
+
+        # Out of rewrites: ship it if nothing left is a factual problem. Losing a
+        # sound card because its board summary ran long is worse than the long summary.
+        if attempt == _VALIDATION_ATTEMPTS:
+            blocking = blocking_errors(candidate, signal_descriptions, reg_chunks)
+            if not blocking:
+                logger.info(
+                    "Cluster %s accepted with %d advisory issue(s): %s",
+                    cluster_id, len(errors), "; ".join(errors),
+                )
+                card_input = candidate
+                break
+            errors = blocking
+
+        logger.warning(
+            "Card for cluster %s failed validation (attempt %d/%d): %s",
+            cluster_id, attempt, _VALIDATION_ATTEMPTS, "; ".join(errors),
+        )
+
+        # Forced tool_choice makes the model's turn a tool_use block, so the
+        # correction has to come back as a tool_result or the API rejects the turn.
+        messages = messages + [
+            {"role": "assistant", "content": response.content},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_block.id,
+                        "is_error": True,
+                        "content": (
+                            "The card was rejected. Fix every point below and call the tool again.\n"
+                            + "\n".join(f"- {e}" for e in errors)
+                        ),
+                    }
+                ],
+            },
+        ]
+
+    if card_input is None:
+        raise CardValidationError(errors)
 
     # Build the evidence stack - use the model's structured output but enrich
     # with the actual signal URLs from the DB which are more reliable
-    evidence_stack = card_input.get("evidence_stack", [])
-    url_by_title = {s["title"]: s.get("url", "") for s in signal_descriptions}
-    for item in evidence_stack:
-        if not item.get("url"):
-            item["url"] = url_by_title.get(item.get("title", ""), "")
+    evidence_stack = resolve_evidence_urls(card_input.get("evidence_stack", []), signal_descriptions)
 
     card_row = {
         "cluster_id": cluster_id,
@@ -304,6 +416,11 @@ async def _generate_one(db: Any, client: anthropic.Anthropic, cluster: dict[str,
         "score": cluster["score"],
         "metadata": {
             "model": response.model,
+            # Rewrites needed before the card passed. Persisted because a rising
+            # average here is the earliest signal that a prompt change regressed.
+            "validation_attempts": attempt,
+            # Style issues the agent would not fix. Empty on a clean card.
+            "validation_warnings": validate_card(card_input, signal_descriptions, reg_chunks),
             "usage": {
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens,

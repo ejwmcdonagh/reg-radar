@@ -2,9 +2,11 @@
 
 Live signals. Real risk. Board-ready.
 
-Pulse watches cybersecurity threat data from sixteen live sources, groups related signals together, scores them by real-world risk, and writes intelligence cards a CISO can take straight into a board meeting.
+Pulse is an agent that does a threat analyst's job. It reads cybersecurity news from sixteen live sources, works out which stories are really the same story, decides which ones matter, and writes up each one as a card a CISO can take straight into a board meeting.
 
 It is not a compliance tracker. It is a risk intelligence feed that tells you what is happening right now, how serious it is, and what to say about it.
+
+**The agent writes the words on every card.** Nobody checks each card by hand before you read it, so it is worth knowing which parts of the work are a fixed calculation and which parts are the agent using judgement. The next section spells that out, and [How the agent is checked](#how-the-agent-is-checked) covers what stops a bad card reaching you.
 <img width="1440" height="813" alt="image" src="https://github.com/user-attachments/assets/bdc11fe6-e544-4705-ace7-555e34e317b4" />
 
 ---
@@ -25,12 +27,27 @@ Each card has five parts:
 
 ## How it works
 
-Every day the system:
+Every day the agent:
 
 1. Pulls threat data from sixteen built-in sources (see list below)
 2. Groups signals that point at the same underlying threat, independently per risk domain so no domain starves another
 3. Scores each group by severity, recency, source count, and active exploitation status (CISA KEV signals add a +20 bonus)
 4. Writes a card for every group above the score threshold
+
+### Which steps are judgement and which are arithmetic
+
+This matters because the two kinds of step fail in completely different ways.
+
+| Step | Who decides | Can it be wrong? |
+|------|-------------|------------------|
+| 1. Pulling data | Fixed code | Only if a feed breaks, and that is loud |
+| 2. Grouping signals | The agent | Yes. It can split one threat into two cards or merge two threats into one |
+| 3. Scoring a group | Fixed arithmetic | No. Same group in, same score out, every time |
+| 4. Writing the card | The agent | Yes. This is the wording your board reads |
+
+Steps 2 and 4 are the agent reading the evidence and making a call, the same way a human analyst would. Step 3 looks like the clever part but is just addition, and it is fully covered by unit tests.
+
+So when a card looks wrong, the cause is almost always step 2 or step 4, and that is where the checking effort goes.
 
 **Important:** clustering only looks at signals from the last 30 days. Signals are stored permanently but anything older than the window is ignored until the window is extended. See [How the signal window works](#how-the-signal-window-works) for details.
 
@@ -174,10 +191,10 @@ This will take a minute or two the first time. When it finishes you will see out
 ```
 Started supabase local development setup.
 
-         API URL: http://127.0.0.1:54321
-          DB URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
-      Studio URL: http://127.0.0.1:54323
-    Inbucket URL: http://127.0.0.1:54324
+         API URL: http://127.0.0.1:54421
+          DB URL: postgresql://postgres:postgres@127.0.0.1:54422/postgres
+      Studio URL: http://127.0.0.1:54423
+    Inbucket URL: http://127.0.0.1:54424
       JWT secret: super-secret-jwt-token-with-at-least-32-characters-long
         anon key: eyJhbGciOiJIUzI1NiIsInR5cCI6...
 service_role key: eyJhbGciOiJIUzI1NiIsInR5cCI6...
@@ -186,11 +203,13 @@ service_role key: eyJhbGciOiJIUzI1NiIsInR5cCI6...
 Now open `backend/.env` in your text editor again and fill in these two lines using the values from the output above:
 
 ```
-SUPABASE_URL=http://127.0.0.1:54321
+SUPABASE_URL=http://127.0.0.1:54421
 SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6...
 ```
 
-The `SUPABASE_URL` is always `http://127.0.0.1:54321` when running locally.
+The `SUPABASE_URL` is always `http://127.0.0.1:54421` when running locally. Pulse uses the 544xx
+port range rather than Supabase's 543xx defaults, so it can run alongside another local Supabase
+project without clashing. The ports are set in `supabase/config.toml`.
 The `SUPABASE_SERVICE_ROLE_KEY` is the long `service_role key` value from the output. Copy the whole thing.
 
 Save the file.
@@ -372,6 +391,90 @@ Increasing the window means more signals are considered per run and clustering w
 
 ---
 
+## How the agent is checked
+
+The agent writes board copy without a human reading it first, so it needs its own checks. There are two, and they do different jobs.
+
+### The problem being solved
+
+Left alone, the agent writes regulation citations from memory. Asked three times for a card about the same threat, it produced three different sets of article numbers, and one run claimed a fine figure that did not exist in any source it was given. Every one of those cards looked completely convincing. That is the danger: a wrong fine figure in plain English reads exactly like a right one, and it ends up on a board slide.
+
+### Check one: the card contract, on every single card
+
+`app/services/card_validation.py` checks every card before it is saved. No AI involved, so it is free and it gives the same answer every time. It checks:
+
+- **Citations are real.** Every article number and every fine figure in the card must appear in the regulation text the agent was actually given. If the agent was given nothing, it is not allowed to quote any article number or figure at all. It has to stay general.
+- **Evidence links are real.** Every source the card lists must be one of the signals the agent was handed, and the link always comes from the database, never from the agent.
+- **Board copy is readable.** No CVE numbers and no jargon in the two fields non-technical directors read.
+- **Length rules.** Headlines stay under 15 words, board talking points stay at 3 or 4 sentences.
+- **House style.** No em dashes.
+
+If a card fails, the agent is told exactly what is wrong and asked to write it again, up to three times within a single run. If it still cannot produce a clean card, nothing is saved that run and the group goes back in the queue with the reasons recorded against it. After three runs end that way the group is marked failed and stops being retried, so a group that never comes right costs at most nine attempts in total. **A missing card is better than a card with an invented fine in it.**
+
+Every saved card records how many attempts it took, in `metadata.validation_attempts`. If that number starts creeping up, the prompt is drifting.
+
+### Check two: evals, run on purpose
+
+The contract check proves a card is well formed. It cannot tell you whether the agent's *judgement* is any good. That needs examples where a human has already decided what the right answer is.
+
+`backend/tests/eval/test_agent_quality.py` holds those examples. They call the real model, so they cost money and are skipped unless you ask for them:
+
+```bash
+cd backend && pytest -m eval      # live evals, needs ANTHROPIC_API_KEY
+cd backend && pytest              # normal tests, evals skipped
+```
+
+The cases are:
+
+| Eval | What it proves |
+|------|----------------|
+| One vulnerability reported by three sources | The agent makes one card, not three |
+| Three unrelated products with the same bug type | The agent does not lump them together into a card nobody can act on |
+| Citations trace back to source | Given real regulation text, every article number and fine figure the agent writes is actually in it, and the agent does use it rather than staying vague |
+| Card with no regulation text available | The saved card survives a fresh check, and the links on it still point at the right pages |
+| Card needs at most one rewrite | The agent can fix its own mistakes when told what they are |
+
+The third one is the case that prompted this work. The agent was given text saying 10,000,000 EUR and 7,000,000 EUR, and wrote "10 to 14 million". Both halves of that eval are needed: a card that cites nothing at all would pass the accuracy half on a technicality.
+
+That last one matters because the retry loop hides sloppiness. A card that took three attempts looks exactly like a card that took one, so the finished card can never tell you the prompt is getting worse. The number of attempts can.
+
+The test itself is a loose gate on purpose. Card writing runs at default temperature, so one sample cannot prove a pass rate, and demanding a perfect first attempt every time would fail on a perfectly healthy prompt. The real number to watch is the average of `metadata.validation_attempts` across recent cards once the pipeline is running. If that drifts from near 1 towards 2, the prompt needs attention.
+
+### Check three: read what it wrote
+
+The two checks above tell you the rules held. Neither can tell you the writing is any
+good. No mechanical check can: "attackers can take control of our network" and
+"unauthorised access may occur" both pass every rule, and only one of them is worth
+saying to a board.
+
+So there is a third thing, and it is just you reading the output:
+
+```bash
+cd backend && python scripts/review_agent_output.py           # read it
+cd backend && python scripts/review_agent_output.py > review.md   # keep it to compare later
+```
+
+This runs the agent over the same fixtures the evals use and prints everything it
+wrote in full: both clustering decisions, and two complete cards, one with regulation
+text retrieved and one without. For each card it shows how many rewrites it needed,
+whether the contract passed, and the source regulation text so you can check the
+citations yourself.
+
+It needs an Anthropic key but **not** the database, so it works before the stack is
+up. It costs a few cents per run.
+
+Save the output when you change a prompt and diff it against the previous run. That
+is the fastest way to see what a prompt edit actually did, because a passing test
+suite will look identical either way.
+
+### When an eval fails
+
+Fix the prompt, not the eval. These cases exist because a human agreed with the answer, so a failure means the agent changed its mind, not that the bar is too high. Only rewrite a case if you can argue the original call was wrong.
+
+Both prompt fixes currently in the code were found this way. The agent kept writing 17-word headlines against a 15-word limit, and it kept quoting article numbers when it had been given no regulation text to quote from. Neither was visible in the output. Both showed up the moment there was a test that could fail.
+
+---
+
 ## Customising your feed
 
 Go to `http://localhost:3000` and click **Customize your feed** in the top right.
@@ -485,6 +588,8 @@ Based on actual runs with ~2,100 signals across all 13 sources, including RAG re
 
 The first run is more expensive because it processes the full signal backlog. Daily incremental runs will cost less as only new signals get clustered.
 
+These figures were measured before the card contract check existed and assume every card passes first time. A card that gets rewritten costs that much again for each attempt, so real card generation cost is roughly the figure above multiplied by the average `metadata.validation_attempts`. Watch that average: it is both the quality signal and the cost signal.
+
 Token usage per run is logged in the `metadata.usage` field on every cluster and card row in the database, so you can track actual spend over time.
 
 ---
@@ -544,6 +649,7 @@ pulse/
 - [x] Step 2 - Group related signals into clusters
 - [x] Step 3 - Generate 5-layer intelligence cards using AI
 - [x] Step 4 - Dashboard with five domain lanes, card modal, tech stack highlighting, domain filter, team filter, per-team AI impact summaries, simple mode for board-level readers, dismiss cards, hide technologies, RAG-grounded compliance gaps, card pagination, background pipeline jobs with status polling, and optional API key authentication
+- [x] Step 4a - Quality controls on the agent: a contract check on every card, a rewrite loop when a card fails it, and live evals for the agent's judgement (see [How the agent is checked](#how-the-agent-is-checked))
 - [ ] Step 5 - Connect to your SIEM or ticketing system
 - [ ] Step 6 - Weekly email digest
 - [ ] Step 7 - Onboarding flow for new organisations
